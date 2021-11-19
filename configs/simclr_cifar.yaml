@@ -3,6 +3,7 @@ dataset:
   name: cifar10
   image_size: 32
   num_workers: 4
+  download: True
 
 model: 
   name: simclr

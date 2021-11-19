@@ -12,17 +12,26 @@ model:
 train: null
 
 eval: # linear evaluation, False will turn off automatic evaluation after training
-  optimizer: 
-    name: lars
+#  optimizer:
+#    name: lars
+#    weight_decay: 0
+#    momentum: 0.9
+#  warmup_lr: 0
+#  warmup_epochs: 0
+#  base_lr: 0.02
+#  final_lr: 0
+#  batch_size: 4096
+#  num_epochs: 90
+  optimizer:
+    name: sgd
     weight_decay: 0
     momentum: 0.9
   warmup_lr: 0
   warmup_epochs: 0
-  base_lr: 0.02
+  base_lr: 30
   final_lr: 0
-  batch_size: 4096
-  num_epochs: 90
-
+  batch_size: 256
+  num_epochs: 100
 logger:
   tensorboard: False
   matplotlib: False

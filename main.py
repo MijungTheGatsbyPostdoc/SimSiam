@@ -109,6 +109,9 @@ def main(device, args):
 if __name__ == "__main__":
     args = get_args()
 
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print('device is', device)
+
     main(device=args.device, args=args)
 
     completed_log_dir = args.log_dir.replace('in-progress', 'debug' if args.debug else 'completed')

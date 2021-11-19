@@ -1,3 +1,7 @@
+
+# used these are parameters in pycharm
+# --data_dir ../Data/ --log_dir ../logs/ -c configs/simsiam_cifar_eval_lars.yaml --ckpt_dir ~/.cache/ --hide_progress
+
 import os
 import torch
 import torch.nn as nn
@@ -36,6 +40,14 @@ def main(args):
 
 
     model = get_backbone(args.model.backbone)
+
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    print('device is', device)
+    args.device = device # manually added this
+
+    # manually added this
+    args.eval_from = '/ubc/cs/home/m/mijungp/.cache/simsiam-cifar10-experiment-resnet18_cifar_variant1_1118022103.pth'
+
     classifier = nn.Linear(in_features=model.output_dim, out_features=10, bias=True).to(args.device)
 
     assert args.eval_from is not None
