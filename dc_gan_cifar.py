@@ -17,6 +17,7 @@ from models import get_model, get_backbone
 from tools import AverageMeter
 from datasets import get_dataset
 from optimizers import get_optimizer, LR_Scheduler
+from mmd2_estimator import get_real_mmd_loss
 
 # custom weights initialization called on netG
 def weights_init(m):
@@ -33,27 +34,20 @@ class Generator(nn.Module):
         super(Generator, self).__init__()
 
         self.ngpu = ngpu
+        # this architecture is from
+        # https://colab.research.google.com/github/ssundar6087/vision-and-words/blob/master/_notebooks/2020-05-01-DCGAN-CIFAR10.ipynb#scrollTo=i7cwX82GuHRS
         self.main = nn.Sequential(
-            # input is Z, going into a convolution
             nn.ConvTranspose2d(nz, ngf * 8, 4, 1, 0, bias=False),
             nn.BatchNorm2d(ngf * 8),
             nn.ReLU(True),
-            # state size. (ngf*8) x 4 x 4
             nn.ConvTranspose2d(ngf * 8, ngf * 4, 4, 2, 1, bias=False),
             nn.BatchNorm2d(ngf * 4),
             nn.ReLU(True),
-            # state size. (ngf*4) x 8 x 8
             nn.ConvTranspose2d(ngf * 4, ngf * 2, 4, 2, 1, bias=False),
             nn.BatchNorm2d(ngf * 2),
             nn.ReLU(True),
-            # state size. (ngf*2) x 16 x 16
-            nn.ConvTranspose2d(ngf * 2, ngf, 4, 2, 1, bias=False),
-            nn.BatchNorm2d(ngf),
-            nn.ReLU(True),
-            # state size. (ngf) x 32 x 32
-            nn.ConvTranspose2d(ngf, nc, 4, 2, 1, bias=False),
+            nn.ConvTranspose2d(ngf * 2, nc, 4, 2, 1, bias=False),
             nn.Tanh()
-            # state size. (nc) x 64 x 64
         )
 
     def forward(self, input):
@@ -61,7 +55,7 @@ class Generator(nn.Module):
             output = nn.parallel.data_parallel(self.main, input, range(self.ngpu))
         else:
             output = self.main(input)
-            return output
+        return output
 
 def main(args):
 
@@ -101,8 +95,8 @@ def main(args):
     args.device = device  # manually added this
 
     # Load the pre-trained backbone
-    args.eval_from = '/ubc/cs/home/m/mijungp/.cache/simsiam-cifar10-experiment-resnet18_cifar_variant1_1118022103.pth'
-
+    # args.eval_from = '/ubc/cs/home/m/mijungp/.cache/simsiam-cifar10-experiment-resnet18_cifar_variant1_1118022103.pth'
+    args.eval_from = '/home/mijungp/.cache/simsiam-cifar10-experiment-resnet18_cifar_variant1_1118022103.pth'
     assert args.eval_from is not None
     save_dict = torch.load(args.eval_from, map_location='cpu')
     msg = model.load_state_dict({k[9:]: v for k, v in save_dict['state_dict'].items() if k.startswith('backbone.')},
@@ -110,7 +104,7 @@ def main(args):
 
     # print(msg)
     model = model.to(args.device)
-    model = torch.nn.DataParallel(model)
+    model = torch.nn.DataParallel(model) # because it was trained with DataParallel mode
 
     ###### (3) define a generator ######
     ngpu = torch.cuda.device_count()
@@ -146,58 +140,47 @@ def main(args):
     loss_meter = AverageMeter(name='Loss')
     acc_meter = AverageMeter(name='Accuracy')
 
+    rff_sigma = 1 # length scale for kernel
+    n_labels = 10 # for CIFAR10 dataset
+    mmd2loss = get_real_mmd_loss(rff_sigma, n_labels, args.eval.batch_size)
+
     # Start training
     global_progress = tqdm(range(0, args.eval.num_epochs), desc=f'training')
     for epoch in global_progress:
+    # for epoch in range(1, args.eval.num_epochs + 1):
         loss_meter.reset()
         model.eval()
         netG.train()
-        local_progress = tqdm(train_loader, desc=f'Epoch {epoch}/{args.eval.num_epochs}', disable=True)
+        local_progress = tqdm(train_loader, desc=f'Epoch {epoch}/{args.eval.num_epochs}', disable=False)
 
         for idx, (images, labels) in enumerate(local_progress):
-            netG.zero_grad()
+
+            ##########################
             with torch.no_grad():
-                feature = model(images.to(args.device))
+                feature_real = model(images.to(args.device)) # size(images) = batch_size x 3 x 32 x 32
+            ##########################
 
+            ##########################
+            netG.zero_grad()
             noise = torch.randn(args.eval.batch_size, nz, 1, 1, device=device)
-            syn = netG(noise) # batch_size x nc x ngf x ngf
+            syn = netG(noise) # batch_size x 3 x 32 x 32
 
-            # loss = F.cross_entropy(preds, labels.to(args.device))
+            # oops, i need to also generate labels in our case (Will do this later).
+            # let's pretend gen_labels == labels
+            gen_labels = labels.to(args.device)
 
+            feature_syn = model(syn) # unsure if I can do this, but let's check later.
+            ##########################
 
+            # when we compute MMD, we also input the labels.
+            loss = mmd2loss(feature_real, labels.to(args.device), feature_syn, gen_labels)
+            # do I need to add a constraint on the pixel space? it seems so.
 
             loss.backward()
             optimizer.step()
             loss_meter.update(loss.item())
             lr = lr_scheduler.step()
             local_progress.set_postfix({'lr': lr, "loss": loss_meter.val, 'loss_avg': loss_meter.avg})
-
-        #     noise = torch.randn(batch_size, nz, 1, 1, device=device)
-        #     fake = netG(noise)
-        #
-        #     print('[%d/%d][%d/%d] Loss_D: %.4f Loss_G: %.4f D(x): %.4f D(G(z)): %.4f / %.4f' % (
-        #         epoch, niter, i, len(dataloader), errD.item(), errG.item(), D_x, D_G_z1, D_G_z2))
-        #
-        #     # save the output
-        #     if i % 100 == 0:
-        #         print('saving the output')
-        #         vutils.save_image(real_cpu, 'output/real_samples.png', normalize=True)
-        #         fake = netG(fixed_noise)
-        #         vutils.save_image(fake.detach(), 'output/fake_samples_epoch_%03d.png' % (epoch), normalize=True)
-        #
-        # # Check pointing for every epoch
-        # torch.save(netG.state_dict(), 'weights/netG_epoch_%d.pth' % (epoch))
-
-    classifier.eval()
-    correct, total = 0, 0
-    acc_meter.reset()
-    for idx, (images, labels) in enumerate(test_loader):
-        with torch.no_grad():
-            feature = model(images.to(args.device))
-            preds = classifier(feature).argmax(dim=1)
-            correct = (preds == labels.to(args.device)).sum().item()
-            acc_meter.update(correct / preds.shape[0])
-    print(f'Accuracy = {acc_meter.avg * 100:.2f}')
 
 
 if __name__ == "__main__":

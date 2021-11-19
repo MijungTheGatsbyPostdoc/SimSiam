@@ -21,7 +21,7 @@ eval: # for training the generator
   batch_size: 256
   num_epochs: 100
 logger:
-  tensorboard: False
+  tensorboard: True
   matplotlib: False
 
 
