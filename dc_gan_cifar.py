@@ -5,12 +5,8 @@
 # --data_dir ../Data/ --log_dir ../logs/ -c configs/train_gen_cifar10_to_cifar10.yaml --ckpt_dir ~/.cache/ --hide_progress
 
 import random
-import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torchvision
-from tqdm import tqdm
 from arguments import get_args
 from augmentations import get_aug
 from models import get_model, get_backbone
@@ -18,6 +14,11 @@ from tools import AverageMeter
 from datasets import get_dataset
 from optimizers import get_optimizer, LR_Scheduler
 from mmd2_estimator import get_real_mmd_loss
+from torch import optim
+import torchvision.utils as vutils
+import matplotlib.pyplot as plt
+import numpy as np
+from torch.optim.lr_scheduler import StepLR
 
 # custom weights initialization called on netG
 def weights_init(m):
@@ -30,10 +31,13 @@ def weights_init(m):
 
 
 class Generator(nn.Module):
-    def __init__(self, ngpu, nz, ngf, nc):
+    # modify this generator such that we also produce labels.
+    def __init__(self, nz, ngf, nc, n_labels):
         super(Generator, self).__init__()
+        self.d_code = nz
+        self.n_labels = n_labels
 
-        self.ngpu = ngpu
+        # self.ngpu = ngpu
         # this architecture is from
         # https://colab.research.google.com/github/ssundar6087/vision-and-words/blob/master/_notebooks/2020-05-01-DCGAN-CIFAR10.ipynb#scrollTo=i7cwX82GuHRS
         self.main = nn.Sequential(
@@ -51,11 +55,27 @@ class Generator(nn.Module):
         )
 
     def forward(self, input):
-        if input.is_cuda and self.ngpu > 1:
-            output = nn.parallel.data_parallel(self.main, input, range(self.ngpu))
-        else:
-            output = self.main(input)
+        # if input.is_cuda and self.ngpu > 1:
+        #     output = nn.parallel.data_parallel(self.main, input, range(self.ngpu))
+        # else:
+        output = self.main(input)
+
         return output
+
+    def get_code(self, batch_size, device):
+        # generate labels uniformly at random
+        labels = torch.randint(self.n_labels, (batch_size,), device=device)
+        # code = torch.randn(batch_size, self.d_code, device=device)
+        code = torch.randn(batch_size, self.d_code, 1, 1, device=device)
+        return code, labels
+        # gen_one_hots = torch.zeros(batch_size, self.n_labels, device=device)
+        # gen_one_hots.scatter_(1, labels, 1)
+        # code = torch.cat([code, gen_one_hots.to(torch.float32)], dim=1)
+        # # print(code.shape)
+        # if return_labels:
+        #     return code, gen_one_hots
+        # else:
+        #     return code
 
 def main(args):
 
@@ -95,8 +115,8 @@ def main(args):
     args.device = device  # manually added this
 
     # Load the pre-trained backbone
-    # args.eval_from = '/ubc/cs/home/m/mijungp/.cache/simsiam-cifar10-experiment-resnet18_cifar_variant1_1118022103.pth'
-    args.eval_from = '/home/mijungp/.cache/simsiam-cifar10-experiment-resnet18_cifar_variant1_1118022103.pth'
+    args.eval_from = '/ubc/cs/home/m/mijungp/.cache/simsiam-cifar10-experiment-resnet18_cifar_variant1_1118022103.pth'
+    # args.eval_from = '/home/mijungp/.cache/simsiam-cifar10-experiment-resnet18_cifar_variant1_1118022103.pth'
     assert args.eval_from is not None
     save_dict = torch.load(args.eval_from, map_location='cpu')
     msg = model.load_state_dict({k[9:]: v for k, v in save_dict['state_dict'].items() if k.startswith('backbone.')},
@@ -105,82 +125,102 @@ def main(args):
     # print(msg)
     model = model.to(args.device)
     model = torch.nn.DataParallel(model) # because it was trained with DataParallel mode
+    # Freeze all the parameters in backbone
+    for param in model.parameters():
+        param.requires_grad = False
 
     ###### (3) define a generator ######
-    ngpu = torch.cuda.device_count()
+    # ngpu = torch.cuda.device_count()
     nz = 100 # input noise dimension
     ngf = 64 # number of generator filters
     nc = 3 # number of channels
-    netG = Generator(ngpu, nz, ngf, nc).to(device)
+    n_labels = len(train_loader.dataset.classes) # 10 for CIFAR10 dataset
+    n_train_data = len(train_loader.dataset.data) # 50,000 for CIFAR10
+    netG = Generator(nz, ngf, nc, n_labels).to(device)
     netG.apply(weights_init)
     print(netG)
 
-    # classifier = nn.Linear(in_features=model.output_dim, out_features=10, bias=True).to(args.device)
-    # classifier = torch.nn.DataParallel(classifier)
-    # define optimizer
-    # setup optimizer
-    # optimizerG = optim.Adam(netG.parameters(), lr=0.0002, betas=(0.5, 0.999))
-    # fixed_noise = torch.randn(128, nz, 1, 1, device=device)
+    optimizer = torch.optim.Adam(list(netG.parameters()), lr=args.eval.base_lr)
+    scheduler = StepLR(optimizer, step_size=1, gamma=0.9)
 
-    optimizer = get_optimizer(
-        args.eval.optimizer.name, netG,
-        lr=args.eval.base_lr * args.eval.batch_size / 256,
-        momentum=args.eval.optimizer.momentum,
-        weight_decay=args.eval.optimizer.weight_decay)
-
-    # define lr scheduler
-    lr_scheduler = LR_Scheduler(
-        optimizer,
-        args.eval.warmup_epochs, args.eval.warmup_lr * args.eval.batch_size / 256,
-        args.eval.num_epochs, args.eval.base_lr * args.eval.batch_size / 256,
-                                 args.eval.final_lr * args.eval.batch_size / 256,
-        len(train_loader),
-    )
-
-    loss_meter = AverageMeter(name='Loss')
-    acc_meter = AverageMeter(name='Accuracy')
-
+    # TO-DO: add median heuristic for both kernels on pixel and latent space
     rff_sigma = 1 # length scale for kernel
-    n_labels = 10 # for CIFAR10 dataset
     mmd2loss = get_real_mmd_loss(rff_sigma, n_labels, args.eval.batch_size)
 
     # Start training
-    global_progress = tqdm(range(0, args.eval.num_epochs), desc=f'training')
-    for epoch in global_progress:
-    # for epoch in range(1, args.eval.num_epochs + 1):
-        loss_meter.reset()
+    for epoch in range(1, args.eval.num_epochs + 1):
+
         model.eval()
         netG.train()
-        local_progress = tqdm(train_loader, desc=f'Epoch {epoch}/{args.eval.num_epochs}', disable=False)
 
-        for idx, (images, labels) in enumerate(local_progress):
+        for idx, (images, labels) in enumerate(train_loader):
 
             ##########################
-            with torch.no_grad():
-                feature_real = model(images.to(args.device)) # size(images) = batch_size x 3 x 32 x 32
+            # with torch.no_grad():
+            feature_real = model(images.to(args.device)) # size(images) = batch_size x 3 x 32 x 32
+            # print('feature shape real', feature_real.shape)
             ##########################
 
             ##########################
             netG.zero_grad()
-            noise = torch.randn(args.eval.batch_size, nz, 1, 1, device=device)
-            syn = netG(noise) # batch_size x 3 x 32 x 32
-
-            # oops, i need to also generate labels in our case (Will do this later).
-            # let's pretend gen_labels == labels
-            gen_labels = labels.to(args.device)
-
+            gen_code, gen_labels = netG.get_code(args.eval.batch_size, device)
+            # noise = torch.randn(args.eval.batch_size, nz, 1, 1, device=device)
+            syn = netG(gen_code) # batch_size x 3 x 32 x 32
             feature_syn = model(syn) # unsure if I can do this, but let's check later.
+            # print('feature shape syn', feature_syn.shape)
             ##########################
 
             # when we compute MMD, we also input the labels.
-            loss = mmd2loss(feature_real, labels.to(args.device), feature_syn, gen_labels)
-            # do I need to add a constraint on the pixel space? it seems so.
+            loss_latent = mmd2loss(feature_real, labels.to(args.device), feature_syn, gen_labels)
+            loss_pixel = mmd2loss(torch.reshape(images.to(args.device), (args.eval.batch_size,-1)), labels.to(args.device), torch.reshape(syn, (args.eval.batch_size,-1)), gen_labels)
+
+            # To-Do: add a hyperparameter to loss_pixel to match the strength of two losses
+            loss = loss_latent + loss_pixel
 
             loss.backward()
+
+            ## sanity check
+            # for param_G in netG.parameters():
+            #     print('parameters of G requires grad: ',  param_G.requires_grad)
+            # for param in model.parameters():
+            #     print('parameters of backbone requires grad: ', param.requires_grad)
+
+            # To-Do: check again if parameters of backbone are updated during training.
+
             optimizer.step()
-            loss_meter.update(loss.item())
-            lr = lr_scheduler.step()
-            local_progress.set_postfix({'lr': lr, "loss": loss_meter.val, 'loss_avg': loss_meter.avg})
+            scheduler.step()
+
+
+        print('Train Epoch: {} [{}/{}]\tLoss: {:.6f}'.format(epoch, idx * len(images), n_train_data, loss.item()))
+        print('loss_latent', loss_latent)
+        print('loss_pixel', loss_pixel)
+
+
+    # after training is over, store syn images
+    with torch.no_grad():
+        gen_code, gen_labels = netG.get_code(args.eval.batch_size, device)
+        syn = netG(gen_code)  # batch_size x 3 x 32 x 32
+        syn_images = syn.detach().cpu()
+
+    # visualize  real and syn data
+    # Grab a batch of real images from the dataloader
+    real_batch = next(iter(train_loader))
+
+    # Plot the real images
+    plt.figure(figsize=(15, 15))
+    plt.subplot(1, 2, 1)
+    plt.axis("off")
+    plt.title("Real Images")
+    plt.imshow(np.transpose(vutils.make_grid(real_batch[0].to(device)[:64], padding=5, normalize=True).cpu(), (1, 2, 0)))
+
+    # Plot the fake images from the last epoch
+    plt.subplot(1, 2, 2)
+    plt.axis("off")
+    plt.title("Fake Images")
+    plt.imshow(np.transpose(vutils.make_grid(syn_images[:64], padding=5, normalize=True), (1, 2, 0)))
+    plt.savefig("mygraph.png")
+    # plt.show()
+
 
 
 if __name__ == "__main__":

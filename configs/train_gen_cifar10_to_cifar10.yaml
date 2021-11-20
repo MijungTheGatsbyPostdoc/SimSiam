@@ -10,18 +10,18 @@ model:
   proj_layers: 2
 
 eval: # for training the generator
-  optimizer:
-    name: sgd
-    weight_decay: 0
-    momentum: 0.9
-  warmup_lr: 0
-  warmup_epochs: 0
-  base_lr: 30
+#  optimizer:
+#    name: sgd
+#    weight_decay: 0
+#    momentum: 0.9
+#  warmup_lr: 0
+#  warmup_epochs: 0
+  base_lr: 0.01
   final_lr: 0
   batch_size: 256
   num_epochs: 100
 logger:
-  tensorboard: True
+  tensorboard: False
   matplotlib: False
 
 
