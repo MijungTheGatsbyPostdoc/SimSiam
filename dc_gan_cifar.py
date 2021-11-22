@@ -95,7 +95,8 @@ def save_images(gen, how_many, data_real_loader, epoch_num, device):
     plt.axis("off")
     plt.title("Fake Images")
     plt.imshow(np.transpose(vutils.make_grid(syn_images[:how_many], padding=5, normalize=True), (1, 2, 0)))
-    plt.savefig(str(epoch_num)+'th_generated_images.png')
+    # plt.savefig(str(epoch_num)+'th_generated_images_ch_wise.png')
+    plt.savefig(str(epoch_num) + 'th_generated_images_pt1.png')
     # plt.show()
 
 
@@ -176,9 +177,14 @@ def main(args):
     num_iter = n_train_data/args.eval.batch_size
     sigma2_arr = np.zeros(int(num_iter))
     sigma2_arr_pxl = np.zeros(int(num_iter))
+    sigma2_arr_pxl_ch1 = np.zeros(int(num_iter))
+    sigma2_arr_pxl_ch2 = np.zeros(int(num_iter))
+    sigma2_arr_pxl_ch3 = np.zeros(int(num_iter))
+
     for batch_idx, (data, labels) in enumerate(train_loader):
         # unpack data
         data, labels = data.to(device), labels.to(device)
+        # print(' size of data ', data.shape)
 
         # median for features
         data_feat = model(data)
@@ -187,20 +193,48 @@ def main(args):
         sigma2_arr[batch_idx] = sigma2
 
         # median for data
-        data_flattened = torch.reshape(data, (args.eval.batch_size, -1))
+        data_flattened = torch.reshape(data[:,0,:,:], (args.eval.batch_size, -1))
         med = meddistance.meddistance(data_flattened.detach().cpu().numpy())
         sigma2 = med**2
-        sigma2_arr_pxl[batch_idx] = sigma2
+        sigma2_arr_pxl_ch1[batch_idx] = sigma2
+
+        data_flattened = torch.reshape(data[:,1,:,:], (args.eval.batch_size, -1))
+        med = meddistance.meddistance(data_flattened.detach().cpu().numpy())
+        sigma2 = med**2
+        sigma2_arr_pxl_ch2[batch_idx] = sigma2
+
+        data_flattened = torch.reshape(data[:,2,:,:], (args.eval.batch_size, -1))
+        med = meddistance.meddistance(data_flattened.detach().cpu().numpy())
+        sigma2 = med**2
+        sigma2_arr_pxl_ch3[batch_idx] = sigma2
+
+
+        # median for each channel
+
         # print(sigma2)
 
     rff_sigma2 = torch.tensor(np.mean(sigma2_arr))
-    print('length scale', rff_sigma2)
-    rff_sigma2_pxl = torch.tensor(np.mean(sigma2_arr_pxl))
-    print('length scale', rff_sigma2_pxl)
+    print('length scale (latent)', rff_sigma2)
+    # rff_sigma2_pxl = torch.tensor(np.mean(sigma2_arr_pxl))
+    # print('length scale (pixel)', rff_sigma2_pxl)
+
+    rff_sigma2_pxl_ch1 = torch.tensor(np.mean(sigma2_arr_pxl_ch1))
+    print('length scale (ch1)', rff_sigma2_pxl_ch1)
+
+    rff_sigma2_pxl_ch2 = torch.tensor(np.mean(sigma2_arr_pxl_ch2))
+    print('length scale (ch2)', rff_sigma2_pxl_ch2)
+
+    rff_sigma2_pxl_ch3 = torch.tensor(np.mean(sigma2_arr_pxl_ch3))
+    print('length scale (ch3)', rff_sigma2_pxl_ch3)
+
+
 
 
     mmd2loss_feat = get_real_mmd_loss(rff_sigma2, n_labels, args.eval.batch_size)
-    mmd2loss_pixel = get_real_mmd_loss(rff_sigma2_pxl, n_labels, args.eval.batch_size)
+    # mmd2loss_pixel = get_real_mmd_loss(rff_sigma2_pxl, n_labels, args.eval.batch_size)
+    mmd2loss_pixel_ch1 = get_real_mmd_loss(rff_sigma2_pxl_ch1, n_labels, args.eval.batch_size)
+    mmd2loss_pixel_ch2 = get_real_mmd_loss(rff_sigma2_pxl_ch2, n_labels, args.eval.batch_size)
+    mmd2loss_pixel_ch3 = get_real_mmd_loss(rff_sigma2_pxl_ch3, n_labels, args.eval.batch_size)
 
     # Start training
     for epoch in range(1, args.eval.num_epochs + 1):
@@ -227,10 +261,23 @@ def main(args):
 
             # when we compute MMD, we also input the labels.
             loss_latent = mmd2loss_feat(feature_real, labels.to(args.device), feature_syn, gen_labels)
-            loss_pixel = mmd2loss_pixel(torch.reshape(images.to(args.device), (args.eval.batch_size,-1)), labels.to(args.device), torch.reshape(syn, (args.eval.batch_size,-1)), gen_labels)
+            # loss_pixel = mmd2loss_pixel(torch.reshape(images.to(args.device), (args.eval.batch_size,-1)), labels.to(args.device), torch.reshape(syn, (args.eval.batch_size,-1)), gen_labels)
+
+            loss_pixel_ch1 = mmd2loss_pixel_ch1(torch.reshape(images[:,0,:,:].to(args.device), (args.eval.batch_size, -1)),
+                                        labels.to(args.device), torch.reshape(syn[:,0,:,:], (args.eval.batch_size, -1)),
+                                        gen_labels)
+            loss_pixel_ch2 = mmd2loss_pixel_ch2(torch.reshape(images[:,1,:,:].to(args.device), (args.eval.batch_size, -1)),
+                                        labels.to(args.device), torch.reshape(syn[:,1,:,:], (args.eval.batch_size, -1)),
+                                        gen_labels)
+            loss_pixel_ch3 = mmd2loss_pixel_ch3(torch.reshape(images[:,2,:,:].to(args.device), (args.eval.batch_size, -1)),
+                                        labels.to(args.device), torch.reshape(syn[:,2,:,:], (args.eval.batch_size, -1)),
+                                        gen_labels)
 
             # To-Do: add a hyperparameter to loss_pixel to match the strength of two losses
-            loss = loss_latent + loss_pixel
+            # loss = loss_latent + loss_pixel
+
+            lamb = 0.1 # pixel loss can be 10 times larger than latent loss, or latent loss is 10 times more sensitive than pixel loss
+            loss = loss_latent + lamb * ( loss_pixel_ch1 + loss_pixel_ch2 + loss_pixel_ch3 )
 
             loss.backward()
             optimizer.step()
@@ -245,8 +292,12 @@ def main(args):
 
         scheduler.step()
         print('Train Epoch: {} [{}/{}]\tLoss: {:.6f}'.format(epoch, idx * len(images), n_train_data, loss.item()))
+        print('loss', loss)
         print('loss_latent', loss_latent)
-        print('loss_pixel', loss_pixel)
+        # print('loss_pixel', loss_pixel)
+        print('loss_pixel_ch1', loss_pixel_ch1)
+        print('loss_pixel_ch2', loss_pixel_ch2)
+        print('loss_pixel_ch3', loss_pixel_ch3)
 
         # check if parameters of backbone are updated during training.
         # print('PARAMS In BACKBONE')
