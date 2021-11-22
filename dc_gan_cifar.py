@@ -19,6 +19,7 @@ import torchvision.utils as vutils
 import matplotlib.pyplot as plt
 import numpy as np
 from torch.optim.lr_scheduler import StepLR
+import meddistance
 
 # custom weights initialization called on netG
 def weights_init(m):
@@ -68,16 +69,41 @@ class Generator(nn.Module):
         # code = torch.randn(batch_size, self.d_code, device=device)
         code = torch.randn(batch_size, self.d_code, 1, 1, device=device)
         return code, labels
-        # gen_one_hots = torch.zeros(batch_size, self.n_labels, device=device)
-        # gen_one_hots.scatter_(1, labels, 1)
-        # code = torch.cat([code, gen_one_hots.to(torch.float32)], dim=1)
-        # # print(code.shape)
-        # if return_labels:
-        #     return code, gen_one_hots
-        # else:
-        #     return code
+
+
+
+def save_images(gen, how_many, data_real_loader, epoch_num, device):
+    # after training is over, store syn images
+    with torch.no_grad():
+        gen_code, gen_labels = gen.get_code(how_many, device)
+        syn = gen(gen_code)  # batch_size x 3 x 32 x 32
+        syn_images = syn.detach().cpu()
+
+    # visualize  real and syn data
+    # Grab a batch of real images from the dataloader
+    real_batch = next(iter(data_real_loader))
+
+    # Plot the real images
+    plt.figure(figsize=(15, 15))
+    plt.subplot(1, 2, 1)
+    plt.axis("off")
+    plt.title("Real Images")
+    plt.imshow(np.transpose(vutils.make_grid(real_batch[0].to(device)[:how_many], padding=5, normalize=True).cpu(), (1, 2, 0)))
+
+    # Plot the fake images from the last epoch
+    plt.subplot(1, 2, 2)
+    plt.axis("off")
+    plt.title("Fake Images")
+    plt.imshow(np.transpose(vutils.make_grid(syn_images[:how_many], padding=5, normalize=True), (1, 2, 0)))
+    plt.savefig(str(epoch_num)+'th_generated_images.png')
+    # plt.show()
+
+
+
 
 def main(args):
+
+    torch.set_printoptions(precision=10)
 
     # set manual seed to a constant get a consistent output
     manualSeed = random.randint(1, 10000)
@@ -137,21 +163,50 @@ def main(args):
     n_labels = len(train_loader.dataset.classes) # 10 for CIFAR10 dataset
     n_train_data = len(train_loader.dataset.data) # 50,000 for CIFAR10
     netG = Generator(nz, ngf, nc, n_labels).to(device)
+    # netG = torch.nn.DataParallel(netG)
     netG.apply(weights_init)
     print(netG)
 
     optimizer = torch.optim.Adam(list(netG.parameters()), lr=args.eval.base_lr)
     scheduler = StepLR(optimizer, step_size=1, gamma=0.9)
 
-    # TO-DO: add median heuristic for both kernels on pixel and latent space
-    rff_sigma = 1 # length scale for kernel
-    mmd2loss = get_real_mmd_loss(rff_sigma, n_labels, args.eval.batch_size)
+    ###  median heuristic for both kernels on pixel and latent space ###
+
+    # set the scale length
+    num_iter = n_train_data/args.eval.batch_size
+    sigma2_arr = np.zeros(int(num_iter))
+    sigma2_arr_pxl = np.zeros(int(num_iter))
+    for batch_idx, (data, labels) in enumerate(train_loader):
+        # unpack data
+        data, labels = data.to(device), labels.to(device)
+
+        # median for features
+        data_feat = model(data)
+        med = meddistance.meddistance(data_feat.detach().cpu().numpy())
+        sigma2 = med**2
+        sigma2_arr[batch_idx] = sigma2
+
+        # median for data
+        data_flattened = torch.reshape(data, (args.eval.batch_size, -1))
+        med = meddistance.meddistance(data_flattened.detach().cpu().numpy())
+        sigma2 = med**2
+        sigma2_arr_pxl[batch_idx] = sigma2
+        # print(sigma2)
+
+    rff_sigma2 = torch.tensor(np.mean(sigma2_arr))
+    print('length scale', rff_sigma2)
+    rff_sigma2_pxl = torch.tensor(np.mean(sigma2_arr_pxl))
+    print('length scale', rff_sigma2_pxl)
+
+
+    mmd2loss_feat = get_real_mmd_loss(rff_sigma2, n_labels, args.eval.batch_size)
+    mmd2loss_pixel = get_real_mmd_loss(rff_sigma2_pxl, n_labels, args.eval.batch_size)
 
     # Start training
     for epoch in range(1, args.eval.num_epochs + 1):
 
-        model.eval()
-        netG.train()
+        # model.eval()
+        # netG.train()
 
         for idx, (images, labels) in enumerate(train_loader):
 
@@ -162,7 +217,7 @@ def main(args):
             ##########################
 
             ##########################
-            netG.zero_grad()
+            optimizer.zero_grad()
             gen_code, gen_labels = netG.get_code(args.eval.batch_size, device)
             # noise = torch.randn(args.eval.batch_size, nz, 1, 1, device=device)
             syn = netG(gen_code) # batch_size x 3 x 32 x 32
@@ -171,13 +226,15 @@ def main(args):
             ##########################
 
             # when we compute MMD, we also input the labels.
-            loss_latent = mmd2loss(feature_real, labels.to(args.device), feature_syn, gen_labels)
-            loss_pixel = mmd2loss(torch.reshape(images.to(args.device), (args.eval.batch_size,-1)), labels.to(args.device), torch.reshape(syn, (args.eval.batch_size,-1)), gen_labels)
+            loss_latent = mmd2loss_feat(feature_real, labels.to(args.device), feature_syn, gen_labels)
+            loss_pixel = mmd2loss_pixel(torch.reshape(images.to(args.device), (args.eval.batch_size,-1)), labels.to(args.device), torch.reshape(syn, (args.eval.batch_size,-1)), gen_labels)
 
             # To-Do: add a hyperparameter to loss_pixel to match the strength of two losses
             loss = loss_latent + loss_pixel
 
             loss.backward()
+            optimizer.step()
+
 
             ## sanity check
             # for param_G in netG.parameters():
@@ -185,41 +242,27 @@ def main(args):
             # for param in model.parameters():
             #     print('parameters of backbone requires grad: ', param.requires_grad)
 
-            # To-Do: check again if parameters of backbone are updated during training.
 
-            optimizer.step()
-            scheduler.step()
-
-
+        scheduler.step()
         print('Train Epoch: {} [{}/{}]\tLoss: {:.6f}'.format(epoch, idx * len(images), n_train_data, loss.item()))
         print('loss_latent', loss_latent)
         print('loss_pixel', loss_pixel)
 
+        # check if parameters of backbone are updated during training.
+        # print('PARAMS In BACKBONE')
+        # for param in model.parameters():
+        #     print(torch.sum(param.data))
 
-    # after training is over, store syn images
-    with torch.no_grad():
-        gen_code, gen_labels = netG.get_code(args.eval.batch_size, device)
-        syn = netG(gen_code)  # batch_size x 3 x 32 x 32
-        syn_images = syn.detach().cpu()
+        # print('PARAMS In netG')
+        # for param in netG.parameters():
+        #     print(torch.sum(param.data))
 
-    # visualize  real and syn data
-    # Grab a batch of real images from the dataloader
-    real_batch = next(iter(train_loader))
+        ### Save generated images ###
+        if (epoch % 50 ==0)&(epoch!=0):
+            save_images(netG, 64, train_loader, epoch, device)
 
-    # Plot the real images
-    plt.figure(figsize=(15, 15))
-    plt.subplot(1, 2, 1)
-    plt.axis("off")
-    plt.title("Real Images")
-    plt.imshow(np.transpose(vutils.make_grid(real_batch[0].to(device)[:64], padding=5, normalize=True).cpu(), (1, 2, 0)))
 
-    # Plot the fake images from the last epoch
-    plt.subplot(1, 2, 2)
-    plt.axis("off")
-    plt.title("Fake Images")
-    plt.imshow(np.transpose(vutils.make_grid(syn_images[:64], padding=5, normalize=True), (1, 2, 0)))
-    plt.savefig("mygraph.png")
-    # plt.show()
+
 
 
 
